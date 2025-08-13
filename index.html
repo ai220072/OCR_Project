@@ -1,240 +1,125 @@
-<!doctype html>
+<!DOCTYPE html>
 <html>
 <head>
-  <meta charset="utf-8" />
-  <title>OCR Table → Google Sheet</title>
-  <script src="https://unpkg.com/tesseract.js@v4.0.2/dist/tesseract.min.js"></script>
-  <style>
-    body { font-family: Arial, sans-serif; padding: 16px; max-width: 1100px; margin: auto; }
-    input, button { margin: 8px 0; padding: 6px 10px; }
-    img { max-width: 100%; height: auto; border: 1px solid #ddd; margin-top: 8px; }
-    table { width: 100%; border-collapse: collapse; margin-top: 12px; }
-    th, td { border: 1px solid #ccc; padding: 6px; text-align: left; }
-    #progress { margin-top: 8px; font-weight: bold; }
-    pre { background: #f7f7f7; padding: 10px; border: 1px solid #ddd; max-height: 300px; overflow: auto; }
-  </style>
+    <meta charset="UTF-8">
+    <title>OCR Table Extractor</title>
+    <style>
+        body { font-family: Arial; padding: 20px; }
+        canvas { max-width: 100%; border: 1px solid #ccc; margin-top: 10px; }
+        table { border-collapse: collapse; margin-top: 20px; width: 100%; }
+        table, th, td { border: 1px solid black; padding: 5px; }
+    </style>
 </head>
 <body>
-  <h1>OCR Table → Google Sheet</h1>
+    <h2>OCR Table Extractor (Offline)</h2>
+    <input type="file" id="imageInput" accept="image/*"><br>
+    <canvas id="canvas"></canvas>
+    <table id="outputTable">
+        <thead>
+            <tr>
+                <th>Proposal No</th>
+                <th>Company Name</th>
+                <th>Person in Charge</th>
+                <th>Tel/Fax</th>
+                <th>State</th>
+                <th>Company Address</th>
+                <th>Type of Project</th>
+            </tr>
+        </thead>
+        <tbody></tbody>
+    </table>
 
-  <p>Select or take a photo of the table rows:</p>
-  <input id="file" type="file" accept="image/*" capture="environment" />
-  <br>
-  <button id="processBtn">Run OCR & Parse</button>
-  <div id="progress"></div>
-  <img id="preview" alt="preview" />
+    <!-- OpenCV.js -->
+    <script async src="https://docs.opencv.org/4.x/opencv.js" onload="onOpenCvReady();"></script>
+    <!-- Tesseract.js -->
+    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
 
-  <h3>Detected Rows</h3>
-  <div id="results"></div>
+    <script>
+        let imgElement = document.createElement('img');
+        let canvas = document.getElementById('canvas');
+        let ctx = canvas.getContext('2d');
 
-  <p><button id="sendAllBtn">Send All Rows to Google Sheet</button></p>
+        document.getElementById('imageInput').addEventListener('change', function(e) {
+            let file = e.target.files[0];
+            let reader = new FileReader();
+            reader.onload = function(event) {
+                imgElement.onload = function() {
+                    canvas.width = imgElement.width;
+                    canvas.height = imgElement.height;
+                    ctx.drawImage(imgElement, 0, 0);
+                    processImage();
+                };
+                imgElement.src = event.target.result;
+            };
+            reader.readAsDataURL(file);
+        });
 
-  <h3>Debug Log</h3>
-  <pre id="log"></pre>
-
-<script>
-const APP_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxdqykMc6lSTqHRK_GAcWJ9T3Qe3nl6WWCAauU0agijwG7LAty9JPqbIJf3x2wP9cjRHg/exec'; // <-- Replace with your URL
-
-const fileInput = document.getElementById('file');
-const preview = document.getElementById('preview');
-const progress = document.getElementById('progress');
-const resultsDiv = document.getElementById('results');
-const processBtn = document.getElementById('processBtn');
-const sendAllBtn = document.getElementById('sendAllBtn');
-const logEl = document.getElementById('log');
-
-let lastParsedRows = [];
-
-function log(msg) {
-  console.log(msg);
-  logEl.textContent += msg + "\n";
-}
-
-fileInput.addEventListener('change', () => {
-  const f = fileInput.files[0];
-  if (!f) return;
-  const url = URL.createObjectURL(f);
-  preview.src = url;
-  logEl.textContent = '';
-});
-
-processBtn.addEventListener('click', async () => {
-  const f = fileInput.files[0];
-  if (!f) { alert('Choose an image first'); return; }
-  logEl.textContent = '';
-  progress.innerText = 'Starting OCR...';
-  log("Starting OCR...");
-
-  const { data } = await Tesseract.recognize(f, 'eng', {
-    logger: m => {
-      if (m.status === 'recognizing text') {
-        progress.innerText = `OCR: ${(m.progress*100).toFixed(1)}%`;
-      } else {
-        progress.innerText = m.status;
-      }
-    }
-  });
-
-  log("OCR complete. Words detected: " + (data.words ? data.words.length : 0));
-  progress.innerText = 'Parsing with bounding boxes...';
-
-  const parsedRows = parseUsingBoundingBoxes(data);
-  lastParsedRows = parsedRows;
-  showResults(parsedRows);
-  progress.innerText = 'Done';
-  log("Parsing finished. Rows extracted: " + parsedRows.length);
-});
-
-sendAllBtn.addEventListener('click', async () => {
-  if (!lastParsedRows.length) { alert('No parsed rows to send. Run OCR first.'); return; }
-  sendAllBtn.disabled = true;
-  try {
-    for (let i = 0; i < lastParsedRows.length; i++) {
-      log(`Sending row ${i+1} to Google Sheet...`);
-      await sendToAppsScript(lastParsedRows[i]);
-    }
-    alert('All rows sent!');
-    log("All rows sent successfully.");
-  } catch (err) {
-    alert('Error sending: ' + err);
-    log("Error sending: " + err);
-  }
-  sendAllBtn.disabled = false;
-});
-
-/**
- * Group words into table rows based on Y position and assign columns by X position
- */
-function parseUsingBoundingBoxes(data) {
-  const words = data.words || [];
-  if (!words.length) return [];
-
-  // Step 1: Group words into rows
-  const rowGroups = [];
-  const rowTolerance = 15; // px vertical grouping tolerance
-  words.forEach(w => {
-    const cy = (w.bbox.y0 + w.bbox.y1) / 2;
-    let found = false;
-    for (const row of rowGroups) {
-      if (Math.abs(row.cy - cy) <= rowTolerance) {
-        row.words.push(w);
-        found = true;
-        break;
-      }
-    }
-    if (!found) {
-      rowGroups.push({ cy, words: [w] });
-    }
-  });
-
-  // Step 2: Sort rows vertically
-  rowGroups.sort((a,b) => a.cy - b.cy);
-
-  // Step 3: Define X ranges for columns (tweak if needed)
-  const colRanges = {
-    proposalNo: [0, 120],
-    companyName: [121, 400],
-    typeOfProject: [401, 480],
-    companyAddress: [481, 850],
-    telFax: [851, 1050],
-    personInCharge: [1051, 1300]
-  };
-
-  log("Defined column ranges (X px): " + JSON.stringify(colRanges));
-
-  // Step 4: Parse each row
-  const parsed = [];
-  for (const [rowIdx, row] of rowGroups.entries()) {
-    const cells = {
-      proposalNo: '',
-      companyName: '',
-      typeOfProject: '',
-      companyAddress: '',
-      telFax: '',
-      personInCharge: ''
-    };
-
-    row.words.sort((a,b) => a.bbox.x0 - b.bbox.x0); // left to right
-    row.words.forEach(w => {
-      const xMid = (w.bbox.x0 + w.bbox.x1) / 2;
-      for (const col in colRanges) {
-        const [xmin, xmax] = colRanges[col];
-        if (xMid >= xmin && xMid <= xmax) {
-          cells[col] += (cells[col] ? ' ' : '') + w.text;
-          break;
+        function onOpenCvReady() {
+            console.log("✅ OpenCV.js loaded");
         }
-      }
-    });
 
-    log(`Row ${rowIdx+1} raw cells: ` + JSON.stringify(cells));
+        function processImage() {
+            let src = cv.imread(imgElement);
+            let gray = new cv.Mat();
+            cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
 
-    // Skip header or empty proposal no
-    if (!/^PZ\d+/i.test(cells.proposalNo.replace(/\s/g,''))) {
-      log(`Skipping row ${rowIdx+1} - no valid proposal number`);
-      continue;
-    }
+            let thresh = new cv.Mat();
+            cv.threshold(gray, thresh, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
 
-    // Derive state from address
-    const STATES = ['KELANTAN','PENANG','PULAU PINANG','JOHOR','KEDAH','PERAK','SELANGOR','KUALA LUMPUR','NEGERI SEMBILAN','PAHANG','TERENGGANU','MELAKA','SABAH','SARAWAK','PUTRAJAYA','LABUAN'];
-    let stateFound = '';
-    for (const s of STATES) {
-      if ((cells.companyAddress || '').toUpperCase().includes(s)) {
-        stateFound = s;
-        break;
-      }
-    }
+            let contours = new cv.MatVector();
+            let hierarchy = new cv.Mat();
+            cv.findContours(thresh, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
-    const finalRow = {
-      proposalNo: cells.proposalNo.trim(),
-      companyName: cells.companyName.trim(),
-      personInCharge: cells.personInCharge.trim(),
-      telFax: cells.telFax.trim(),
-      state: stateFound,
-      companyAddress: cells.companyAddress.trim(),
-      typeOfProject: cells.typeOfProject.trim()
-    };
+            console.log(`🔍 Found ${contours.size()} contours`);
 
-    log(`Row ${rowIdx+1} final parsed: ` + JSON.stringify(finalRow));
-    parsed.push(finalRow);
-  }
+            let boundingBoxes = [];
+            for (let i = 0; i < contours.size(); i++) {
+                let rect = cv.boundingRect(contours.get(i));
+                if (rect.width > 50 && rect.height > 20) { // filter noise
+                    boundingBoxes.push(rect);
+                }
+            }
 
-  return parsed;
-}
+            boundingBoxes.sort((a, b) => a.y - b.y || a.x - b.x);
 
-function showResults(rows) {
-  if (!rows.length) {
-    resultsDiv.innerHTML = '<p>No rows detected. Try improving photo quality.</p>';
-    return;
-  }
-  let html = '<table><thead><tr><th>Proposal No</th><th>Company Name</th><th>Person In Charge</th><th>Tel/Fax</th><th>State</th><th>Address</th><th>Type</th></tr></thead><tbody>';
-  rows.forEach(r => {
-    html += `<tr>
-      <td>${escapeHtml(r.proposalNo)}</td>
-      <td>${escapeHtml(r.companyName)}</td>
-      <td>${escapeHtml(r.personInCharge)}</td>
-      <td>${escapeHtml(r.telFax)}</td>
-      <td>${escapeHtml(r.state)}</td>
-      <td>${escapeHtml(r.companyAddress)}</td>
-      <td>${escapeHtml(r.typeOfProject)}</td>
-    </tr>`;
-  });
-  html += '</tbody></table>';
-  resultsDiv.innerHTML = html;
-}
+            console.log("📦 Bounding boxes:", boundingBoxes);
 
-function escapeHtml(s) {
-  return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
+            let results = [];
+            let ocrPromises = boundingBoxes.map((box, idx) => {
+                let roi = src.roi(box);
+                let roiCanvas = document.createElement('canvas');
+                roiCanvas.width = box.width;
+                roiCanvas.height = box.height;
+                cv.imshow(roiCanvas, roi);
 
-async function sendToAppsScript(payload) {
-  const form = new URLSearchParams();
-  form.append('data', JSON.stringify(payload));
-  const resp = await fetch(APP_SCRIPT_URL, { method:'POST', body: form });
-  if (!resp.ok) throw new Error('Network error: ' + resp.statusText);
-  const j = await resp.json();
-  if (j.status !== 'ok') throw new Error('Apps Script error: ' + JSON.stringify(j));
-  return j;
-}
-</script>
+                return Tesseract.recognize(roiCanvas, 'eng', {
+                    logger: info => console.log(`OCR ${idx}:`, info)
+                }).then(({ data: { text } }) => {
+                    console.log(`📝 Box ${idx} Text:`, text.trim());
+                    results.push(text.trim());
+                });
+            });
+
+            Promise.all(ocrPromises).then(() => {
+                console.log("✅ OCR Finished", results);
+                addToTable(results);
+            });
+
+            src.delete(); gray.delete(); thresh.delete(); contours.delete(); hierarchy.delete();
+        }
+
+        function addToTable(data) {
+            // NOTE: This is just a simple mapping — adjust to match your actual table structure
+            let tbody = document.querySelector("#outputTable tbody");
+            tbody.innerHTML = "";
+            let row = document.createElement("tr");
+            for (let i = 0; i < 7; i++) {
+                let td = document.createElement("td");
+                td.textContent = data[i] || "";
+                row.appendChild(td);
+            }
+            tbody.appendChild(row);
+        }
+    </script>
 </body>
 </html>
