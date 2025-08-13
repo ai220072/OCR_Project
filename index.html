@@ -1,413 +1,153 @@
-<!doctype html>
+<!DOCTYPE html>
 <html>
 <head>
-  <meta charset="utf-8" />
-  <title>OCR → Google Sheet (Hybrid: Browser OCR + GAS)</title>
-  <style>
-    body { font-family: system-ui, Arial, sans-serif; padding: 20px; max-width: 1100px; margin: auto; }
-    .row { display: flex; gap: 16px; flex-wrap: wrap; }
-    .col { flex: 1 1 360px; min-width: 320px; }
-    input, button { margin: 6px 0; padding: 8px 12px; }
-    img, canvas { max-width: 100%; border: 1px solid #ddd; }
-    table { width: 100%; border-collapse: collapse; margin-top: 12px; }
-    th, td { border: 1px solid #ccc; padding: 6px; text-align: left; vertical-align: top; }
-    #progress { font-weight: 600; margin-top: 4px; }
-    pre { background: #f7f7f7; border: 1px solid #ddd; padding: 10px; max-height: 280px; overflow: auto; }
-    .pill { display:inline-block; padding:2px 8px; border-radius:999px; border:1px solid #ddd; margin-left:6px; }
-  </style>
+<meta charset="UTF-8">
+<title>OCR Table to Google Sheets</title>
+<style>
+    body { font-family: Arial, sans-serif; padding: 10px; }
+    #preview { max-width: 100%; margin-top: 10px; }
+    pre { background: #f0f0f0; padding: 5px; font-size: 12px; }
+</style>
 </head>
 <body>
-  <h1>OCR → Google Sheet</h1>
-  <p>
-    Upload a photo of the table (like your sample). OCR runs <b>in your browser</b>, fields are parsed and ordered, then sent to your Google Sheet via <b>Apps Script</b>.
-  </p>
 
-  <div class="row">
-    <div class="col">
-      <label><b>Step 1:</b> Select/take a photo</label><br/>
-      <input id="file" type="file" accept="image/*" capture="environment" />
-      <div id="progress"></div>
-      <div>
-        <span class="pill" id="imgInfo"></span>
-        <span class="pill" id="ocrInfo"></span>
-      </div>
-      <img id="preview" alt="preview" />
-      <canvas id="work" style="display:none;"></canvas>
-    </div>
-    <div class="col">
-      <label><b>Step 2:</b> Process → Parse → Review</label><br/>
-      <button id="processBtn">Run OCR & Parse</button>
-      <button id="sendAllBtn">Send All Rows to Google Sheet</button><br/>
-      <small>Apps Script URL: <code id="appUrlEcho"></code></small>
+<h2>OCR Table Parser (Browser + Google Sheets)</h2>
+<input type="file" id="fileInput" accept="image/*"><br><br>
+<img id="preview" />
 
-      <h3>Detected Rows</h3>
-      <div id="results"></div>
-    </div>
-  </div>
+<h3>Step 1: Process → Parse → Review</h3>
+<button id="runOCR">Run OCR & Parse</button>
+<button id="sendToSheets" disabled>Send All Rows to Google Sheet</button>
 
-  <h3>Debug Log</h3>
-  <pre id="log"></pre>
+<h4>Detected Rows</h4>
+<div id="rowsContainer"></div>
 
-  <!-- OpenCV.js -->
-  <script async src="https://docs.opencv.org/4.x/opencv.js" onload="onOpenCvReady();"></script>
-  <!-- Tesseract.js -->
-  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<h4>Debug Log</h4>
+<pre id="log"></pre>
 
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<script async src="https://docs.opencv.org/4.x/opencv.js"></script>
 <script>
-/** ===================== CONFIG ===================== **/
-const APP_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbzmfiY7yxIR5FiACFBqKy9f2U_B0tBVwTc0nHnF9ZYN6WzPP0_wBFdx0fksY1PKZjsZGA/exec'; // <-- paste your GAS Web App URL
-document.getElementById('appUrlEcho').textContent = APP_SCRIPT_URL ? '✓ configured' : '⚠ missing';
+let imageMat, rowsData = [];
+let logEl = document.getElementById('log');
+let previewEl = document.getElementById('preview');
 
-/** =============== UI / STATE HANDLES =============== **/
-const fileInput = document.getElementById('file');
-const preview = document.getElementById('preview');
-const progressEl = document.getElementById('progress');
-const resultsDiv = document.getElementById('results');
-const processBtn = document.getElementById('processBtn');
-const sendAllBtn = document.getElementById('sendAllBtn');
-const logEl = document.getElementById('log');
-const imgInfo = document.getElementById('imgInfo');
-const ocrInfo = document.getElementById('ocrInfo');
-const workCanvas = document.getElementById('work');
-const workCtx = workCanvas.getContext('2d');
-
-let lastParsedRows = [];
-let loadedImage = new Image();
-
-/** ==================== HELPERS ===================== **/
 function log(msg) {
-  console.log(msg);
-  logEl.textContent += (typeof msg === 'string' ? msg : JSON.stringify(msg)) + "\\n";
+    console.log(msg);
+    logEl.textContent += msg + "\n";
 }
 
-fileInput.addEventListener('change', () => {
-  const f = fileInput.files[0];
-  if (!f) return;
-  const url = URL.createObjectURL(f);
-  loadedImage.onload = () => {
-    preview.src = url;
-    imgInfo.textContent = `Image: ${loadedImage.naturalWidth}×${loadedImage.naturalHeight}`;
-    logEl.textContent = '';
-  };
-  loadedImage.src = url;
-});
-
-function onOpenCvReady() {
-  log('✅ OpenCV.js loaded');
-}
-
-/** ================ IMAGE PREPROCESS ================ **/
-function preprocessToCanvas(img) {
-  // Resize for OCR: width ~ 1600 px (keeps quality reasonable)
-  const targetW = Math.min(1600, img.naturalWidth);
-  const scale = targetW / img.naturalWidth;
-  const targetH = Math.round(img.naturalHeight * scale);
-
-  workCanvas.width = targetW;
-  workCanvas.height = targetH;
-  const tmpCanvas = document.createElement('canvas');
-  tmpCanvas.width = targetW; tmpCanvas.height = targetH;
-  const tctx = tmpCanvas.getContext('2d');
-  tctx.drawImage(img, 0, 0, targetW, targetH);
-
-  // OpenCV pipeline
-  const src = cv.imread(tmpCanvas);
-  let gray = new cv.Mat();
-  cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-
-  // CLAHE to boost contrast
-  let clahe = new cv.CLAHE(2.0, new cv.Size(8, 8));
-  clahe.apply(gray, gray);
-
-  // Slight blur to reduce noise
-  cv.GaussianBlur(gray, gray, new cv.Size(3,3), 0, 0, cv.BORDER_DEFAULT);
-
-  // Adaptive threshold (better for uneven lighting)
-  let bin = new cv.Mat();
-  cv.adaptiveThreshold(gray, bin, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, 23, 7);
-
-  // Optional: remove strong horizontal lines
-  // (helps when tables have thick grid lines)
-  let horiz = new cv.Mat();
-  let kernelW = Math.max(20, Math.floor(targetW / 30));
-  let horizKernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(kernelW, 1));
-  cv.morphologyEx(bin, horiz, cv.MORPH_OPEN, horizKernel);
-  let cleaned = new cv.Mat();
-  cv.subtract(bin, horiz, cleaned);
-
-  cv.imshow(workCanvas, cleaned);
-
-  // cleanup
-  src.delete(); gray.delete(); bin.delete(); horiz.delete(); cleaned.delete(); clahe.delete();
-
-  return workCanvas;
-}
-
-/** ============== OCR + ROW/COLUMN LOGIC ============== **/
-processBtn.addEventListener('click', async () => {
-  if (!loadedImage.src) { alert('Choose an image first'); return; }
-  logEl.textContent = '';
-  progressEl.textContent = 'Preprocessing...';
-  const preppedCanvas = preprocessToCanvas(loadedImage);
-
-  progressEl.textContent = 'OCR running...';
-  log('Starting Tesseract.js');
-  const t0 = performance.now();
-
-  const { data } = await Tesseract.recognize(preppedCanvas, 'eng', {
-    // Helpful configs
-    // PSM 6: Assume a single uniform block of text (works okay for tables after preprocessing)
-    tessedit_pageseg_mode: '6',
-    // Whitelist common characters to reduce noise
-    tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-+()#/:.,; &',
-    logger: m => {
-      if (m.status === 'recognizing text') {
-        progressEl.textContent = `OCR: ${(m.progress*100).toFixed(1)}%`;
-      }
-    }
-  });
-
-  const t1 = performance.now();
-  ocrInfo.textContent = `Words: ${data.words?.length || 0}, time: ${(t1 - t0).toFixed(0)} ms`;
-  log({ ocrTimeMs: (t1 - t0) | 0, words: data.words?.length || 0 });
-
-  progressEl.textContent = 'Parsing...';
-  const rows = parseWithKMeansColumns(data, preppedCanvas.width, preppedCanvas.height);
-  lastParsedRows = rows;
-  renderResults(rows);
-  progressEl.textContent = `Done. Parsed rows: ${rows.length}`;
-});
-
-function parseWithKMeansColumns(ocrData, imgW, imgH) {
-  const words = (ocrData.words || []).filter(w => (w.confidence || 0) >= 60 && (w.text || '').trim());
-  log(`Kept ${words.length} words after confidence filter ≥ 60`);
-
-  // Group words into rows by Y-center
-  const rowTolerance = Math.max(12, Math.round(imgH * 0.012)); // relative to image height
-  const rows = [];
-  for (const w of words) {
-    const cy = (w.bbox.y0 + w.bbox.y1) / 2;
-    let placed = false;
-    for (const r of rows) {
-      if (Math.abs(r.cy - cy) <= rowTolerance) {
-        r.items.push(w);
-        r.cy = (r.cy * r.items.length + cy) / (r.items.length + 1);
-        placed = true;
-        break;
-      }
-    }
-    if (!placed) rows.push({ cy, items: [w] });
-  }
-  rows.sort((a,b)=>a.cy-b.cy);
-  log(`Row groups formed: ${rows.length}`);
-
-  // Collect all xMid values to derive global columns via 1D K-means (K=6)
-  const K = 6; // proposal, company, type, address, tel/fax, person
-  const xMids = words.map(w => (w.bbox.x0 + w.bbox.x1) / 2);
-  const centroids = kmeans1d(xMids, K).sort((a,b)=>a-b);
-  log({ columnCentroids: centroids });
-
-  // Assign each word to nearest centroid => column index
-  function nearestCol(x) {
-    let bestIdx = 0, bestD = Infinity;
-    for (let i=0;i<centroids.length;i++){
-      const d = Math.abs(x - centroids[i]);
-      if (d < bestD) { bestD = d; bestIdx = i; }
-    }
-    return bestIdx;
-  }
-
-  // Known order left→right:
-  // 0: Proposal No, 1: Company Name, 2: Type, 3: Address, 4: Tel/Fax, 5: Person
-  const parsedRows = [];
-
-  const STATES = [
-    'KELANTAN','PENANG','PULAU PINANG','JOHOR','KEDAH','PERAK','SELANGOR','KUALA LUMPUR',
-    'NEGERI SEMBILAN','PAHANG','TERENGGANU','MELAKA','SABAH','SARAWAK','PUTRAJAYA','LABUAN',
-    'PERLIS','W.P. KUALA LUMPUR','WP KUALA LUMPUR','W.P. PUTRAJAYA','WP PUTRAJAYA','W.P. LABUAN','WP LABUAN'
-  ];
-
-  const TYPE_REGEX = /\b(ISO\s*\d{1,5}|HACCP|TS|GMP|HALAL|MS\s*\d{1,5})\b/i;
-  const TELFAX_REGEX = /\b(?:Tel|TEL|Phone|Ph|Fax|FAX|HP|Mobile)[:.\s]*[\+\(]?\d[\d\-\s\(\)]{5,}\b|(?:\b\d{2,4}[-\s]?\d{6,8}\b)/g;
-  const PERSON_HINT = /\b(Mr|Ms|Mrs|En|Pn|Tn|Encik|Puan|Dr|Ir|Dato|Datin|Haji|Hjh)\b/i;
-  const PROPOSAL_REGEX = /\bPZ\s*\d{3,}\b/i;
-
-  // Parse each row
-  rows.forEach((r, idx) => {
-    // Sort words left→right
-    r.items.sort((a,b)=>a.bbox.x0 - b.bbox.x0);
-    // Assign columns
-    const colTexts = Array(K).fill('').map(()=>[]);
-    for (const it of r.items) {
-      const xm = (it.bbox.x0 + it.bbox.x1) / 2;
-      const c = nearestCol(xm);
-      colTexts[c].push(it.text);
-    }
-    const cellText = colTexts.map(arr => arr.join(' ').replace(/\s{2,}/g,' ').trim());
-
-    // Heuristics clean-up
-    let proposalNo = (cellText[0].match(PROPOSAL_REGEX) || [''])[0] || '';
-    if (!proposalNo && PROPOSAL_REGEX.test(r.items.map(w=>w.text).join(' '))) {
-      proposalNo = (r.items.map(w=>w.text).join(' ').match(PROPOSAL_REGEX) || [''])[0];
-    }
-    if (!proposalNo) {
-      // likely header row (skip)
-      log(`Row ${idx+1}: skipped (no proposal number)`);
-      return;
-    }
-    proposalNo = proposalNo.replace(/\s+/g,' ').trim();
-
-    // Company name (take col 1)
-    let companyName = cellText[1];
-
-    // Type (keywords)
-    let typeOfProject = (cellText[2].match(TYPE_REGEX) || [''])[0] || '';
-
-    // Address
-    let companyAddress = cellText[3];
-
-    // Tel/Fax
-    let telFax = '';
-    const tfMatches = (cellText[4].match(TELFAX_REGEX) || []);
-    if (tfMatches.length) telFax = tfMatches.join(' ; ');
-    if (!telFax) {
-      // try whole row fallback
-      const m2 = (r.items.map(w=>w.text).join(' ').match(TELFAX_REGEX) || []);
-      if (m2.length) telFax = m2.join(' ; ');
-    }
-    telFax = telFax.replace(/\s{2,}/g,' ').trim();
-
-    // Person In Charge
-    let personInCharge = '';
-    if (PERSON_HINT.test(cellText[5])) personInCharge = cellText[5];
-    if (!personInCharge) {
-      // fallback: scan entire row text near right side
-      const rowText = r.items.map(w=>w.text).join(' ');
-      if (PERSON_HINT.test(rowText)) personInCharge = rowText.match(new RegExp(PERSON_HINT, 'i')).input || '';
-      personInCharge = cellText[5] || '';
-    }
-    personInCharge = personInCharge.replace(/\s{2,}/g,' ').trim();
-
-    // State from address or entire row
-    let stateFound = '';
-    const bigTextUpper = (companyAddress + ' ' + r.items.map(w=>w.text).join(' ')).toUpperCase();
-    for (const s of STATES) { if (bigTextUpper.includes(s)) { stateFound = s; break; } }
-    if (stateFound === 'PULAU PINANG') stateFound = 'PENANG'; // normalize
-
-    const finalRow = {
-      proposalNo,
-      companyName,
-      personInCharge,
-      telFax,
-      state: stateFound,
-      companyAddress,
-      typeOfProject
+document.getElementById('fileInput').addEventListener('change', e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const url = URL.createObjectURL(file);
+    previewEl.src = url;
+    previewEl.onload = () => {
+        log("Image loaded: " + file.name);
     };
+});
 
-    log(`Row ${idx+1} parsed: ` + JSON.stringify(finalRow));
-    parsedRows.push(finalRow);
-  });
+document.getElementById('runOCR').addEventListener('click', async () => {
+    if (!previewEl.src) return alert("Please select an image first.");
+    log("Starting OCR process...");
+    
+    await cv['onRuntimeInitialized']; // Wait for OpenCV
 
-  return parsedRows;
-}
+    // Load image into OpenCV
+    let src = cv.imread(previewEl);
+    let gray = new cv.Mat();
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY, 0);
+    
+    // Threshold to get binary image
+    let thresh = new cv.Mat();
+    cv.adaptiveThreshold(gray, thresh, 255, cv.ADAPTIVE_THRESH_MEAN_C, cv.THRESH_BINARY_INV, 15, 15);
 
-/** ------------- Simple 1D KMeans (K clusters) ------------- **/
-function kmeans1d(points, K, maxIter = 25) {
-  points = points.slice().sort((a,b)=>a-b);
-  if (points.length === 0) return Array.from({length:K}, (_,i)=> (i+1)*((1.0/K)));
-  // init centroids using quantiles
-  const centroids = [];
-  for (let k=1;k<=K;k++) {
-    const q = k/(K+1);
-    const idx = Math.min(points.length-1, Math.max(0, Math.round(q*points.length)-1));
-    centroids.push(points[idx]);
-  }
-  for (let it=0; it<maxIter; it++) {
-    const buckets = Array(K).fill(null).map(()=>[]);
-    for (const p of points) {
-      let bi = 0, bd = Infinity;
-      for (let i=0;i<K;i++){ const d = Math.abs(p - centroids[i]); if (d<bd){ bd=d; bi=i; } }
-      buckets[bi].push(p);
+    // Detect horizontal lines
+    let horizontal = thresh.clone();
+    let horizontalsize = Math.floor(horizontal.cols / 30);
+    let horizontalStructure = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(horizontalsize, 1));
+    cv.erode(horizontal, horizontal, horizontalStructure);
+    cv.dilate(horizontal, horizontal, horizontalStructure);
+
+    // Detect vertical lines
+    let vertical = thresh.clone();
+    let verticalsize = Math.floor(vertical.rows / 30);
+    let verticalStructure = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(1, verticalsize));
+    cv.erode(vertical, vertical, verticalStructure);
+    cv.dilate(vertical, vertical, verticalStructure);
+
+    // Combine lines to get table grid
+    let mask = new cv.Mat();
+    cv.add(horizontal, vertical, mask);
+
+    // Find contours (cells)
+    let contours = new cv.MatVector();
+    let hierarchy = new cv.Mat();
+    cv.findContours(mask, contours, hierarchy, cv.RETR_TREE, cv.CHAIN_APPROX_SIMPLE);
+
+    log(`Detected ${contours.size()} cell contours`);
+
+    let cells = [];
+    for (let i = 0; i < contours.size(); i++) {
+        let rect = cv.boundingRect(contours.get(i));
+        if (rect.width > 30 && rect.height > 15) { // skip noise
+            cells.push(rect);
+        }
     }
-    let moved = false;
-    for (let i=0;i<K;i++) {
-      if (buckets[i].length) {
-        const mean = buckets[i].reduce((a,b)=>a+b,0)/buckets[i].length;
-        if (Math.abs(mean - centroids[i]) > 1e-3) { moved = true; centroids[i] = mean; }
-      }
-    }
-    if (!moved) break;
-  }
-  return centroids;
-}
 
-/** =================== RENDER & SEND =================== **/
-function renderResults(rows) {
-  if (!rows.length) {
-    resultsDiv.innerHTML = '<p>No rows detected. Improve photo quality or crop to a single row.</p>';
-    return;
-  }
-  let html = '<table><thead><tr>' +
-    '<th>Proposal No</th><th>Company Name</th><th>Person In Charge</th>' +
-    '<th>Tel/Fax</th><th>State</th><th>Company Address</th><th>Type of Project</th>' +
-    '</tr></thead><tbody>';
-  rows.forEach((r, idx) => {
-    html += `<tr data-idx="${idx}">
-      <td contenteditable>${escapeHtml(r.proposalNo)}</td>
-      <td contenteditable>${escapeHtml(r.companyName)}</td>
-      <td contenteditable>${escapeHtml(r.personInCharge)}</td>
-      <td contenteditable>${escapeHtml(r.telFax)}</td>
-      <td contenteditable>${escapeHtml(r.state)}</td>
-      <td contenteditable>${escapeHtml(r.companyAddress)}</td>
-      <td contenteditable>${escapeHtml(r.typeOfProject)}</td>
-    </tr>`;
-  });
-  html += '</tbody></table><p><small>You can click any cell to fix OCR mistakes before sending.</small></p>';
-  resultsDiv.innerHTML = html;
-}
-
-function escapeHtml(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-
-sendAllBtn.addEventListener('click', async () => {
-  if (!APP_SCRIPT_URL) { alert('Apps Script URL is not set.'); return; }
-
-  const rows = [];
-  const trs = resultsDiv.querySelectorAll('tbody tr');
-  if (!trs.length) { alert('No rows to send'); return; }
-
-  trs.forEach(tr => {
-    const cells = Array.from(tr.cells).map(td => td.textContent.trim());
-    rows.push({
-      proposalNo: cells[0] || '',
-      companyName: cells[1] || '',
-      personInCharge: cells[2] || '',
-      telFax: cells[3] || '',
-      state: cells[4] || '',
-      companyAddress: cells[5] || '',
-      typeOfProject: cells[6] || ''
+    // Sort cells by row/col
+    cells.sort((a, b) => {
+        if (Math.abs(a.y - b.y) > 15) return a.y - b.y;
+        return a.x - b.x;
     });
-  });
 
-  try {
-    sendAllBtn.disabled = true;
-    log(`Sending ${rows.length} rows to Apps Script...`);
-    // URL-encoded to avoid CORS preflight
-    const form = new URLSearchParams();
-    form.append('data', JSON.stringify(rows));
-    const resp = await fetch(APP_SCRIPT_URL, { method:'POST', body: form });
-    const json = await resp.json();
-    log(json);
-    if (json.status === 'ok') {
-      alert(`✅ Sent ${rows.length} row(s) to Google Sheet`);
-    } else {
-      alert('Error from Apps Script: ' + (json.message || 'unknown'));
+    // Run Tesseract per cell
+    rowsData = [];
+    let currentRow = [], lastY = null;
+    for (let rect of cells) {
+        let roi = src.roi(rect);
+        let canvas = document.createElement('canvas');
+        cv.imshow(canvas, roi);
+        let dataUrl = canvas.toDataURL();
+
+        let text = await Tesseract.recognize(dataUrl, 'eng', { logger: m => {} });
+        let cleaned = text.data.text.trim();
+        
+        if (lastY !== null && Math.abs(rect.y - lastY) > rect.height) {
+            rowsData.push(currentRow);
+            currentRow = [];
+        }
+        currentRow.push(cleaned);
+        lastY = rect.y;
+        roi.delete();
     }
-  } catch (err) {
-    console.error(err);
-    alert('Network/Send error: ' + err.message);
-  } finally {
-    sendAllBtn.disabled = false;
-  }
+    if (currentRow.length) rowsData.push(currentRow);
+
+    log(`Parsed ${rowsData.length} rows`);
+
+    // Show rows
+    let rowsHtml = rowsData.map(r => `<div>${r.join(' | ')}</div>`).join('');
+    document.getElementById('rowsContainer').innerHTML = rowsHtml;
+
+    src.delete(); gray.delete(); thresh.delete();
+    horizontal.delete(); vertical.delete(); mask.delete();
+    contours.delete(); hierarchy.delete();
+    document.getElementById('sendToSheets').disabled = false;
+});
+
+document.getElementById('sendToSheets').addEventListener('click', async () => {
+    const scriptUrl = "YOUR_GOOGLE_APPS_SCRIPT_WEBAPP_URL"; // change to your URL
+    log("Sending data to Google Sheets...");
+    try {
+        let res = await fetch(scriptUrl, {
+            method: "POST",
+            body: JSON.stringify({ rows: rowsData }),
+            headers: { "Content-Type": "application/json" }
+        });
+        log("Google Sheets response: " + await res.text());
+    } catch (err) {
+        log("Error: " + err);
+    }
 });
 </script>
 </body>
