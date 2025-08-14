@@ -28,6 +28,23 @@
   th, td { text-align:left; border-bottom:1px solid #eee; padding:8px; vertical-align: top; }
   .muted { color:#666; font-size:12px; }
   .small { font-size: 12px; }
+  .line-handle {
+    position: absolute;
+    width: 12px;
+    height: 12px;
+    background: #f00;
+    border-radius: 50%;
+    cursor: move;
+    pointer-events: all;
+    transform: translate(-6px, -6px);
+    z-index: 10;
+  }
+  .line-handle.horizontal { background: #00f; }
+  .line-handle.vertical { background: #0a0; }
+  .canvas-container {
+    position: relative;
+    margin-top: 12px;
+  }
 </style>
 </head>
 <body>
@@ -47,9 +64,10 @@
         </div>
       </div>
 
-      <div style="position:relative;margin-top:12px;">
+      <div class="canvas-container">
         <canvas id="preview"></canvas>
         <canvas id="overlay"></canvas>
+        <div id="line-handles"></div>
       </div>
 
       <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:var(--gap);margin-top:12px;">
@@ -142,6 +160,9 @@ let cvReady = false, srcImg=null, srcMat=null, scale=1;
 let columnXs = [];   // x boundaries for columns
 let rowYs = [];      // y boundaries for rows
 let rowsOut = [];    // rows mapped to desired order
+let activeHandle = null;
+let handleOffsetX = 0;
+let handleOffsetY = 0;
 
 function onOpenCvReady(){ cvReady = true; log('OpenCV.js loaded'); maybeEnableScan(); }
 function maybeEnableScan(){ if (cvReady && srcImg) $('scan').disabled = false; }
@@ -205,8 +226,96 @@ $('reset').addEventListener('click', ()=>{
   $('scan').disabled = !srcImg || !cvReady;
   $('send').disabled = true;
   setProgress(0);
+  clearLineHandles();
   log('Reset.');
 });
+
+function clearLineHandles() {
+  $('line-handles').innerHTML = '';
+}
+
+function createLineHandles() {
+  clearLineHandles();
+  
+  const container = $('line-handles');
+  
+  // Vertical lines (columns)
+  for (let i = 0; i < columnXs.length; i++) {
+    const x = columnXs[i] * scale;
+    const handle = document.createElement('div');
+    handle.className = 'line-handle vertical';
+    handle.dataset.type = 'vertical';
+    handle.dataset.index = i;
+    handle.style.left = `${x}px`;
+    handle.style.top = '50%';
+    container.appendChild(handle);
+  }
+  
+  // Horizontal lines (rows)
+  for (let i = 0; i < rowYs.length; i++) {
+    const y = rowYs[i] * scale;
+    const handle = document.createElement('div');
+    handle.className = 'line-handle horizontal';
+    handle.dataset.type = 'horizontal';
+    handle.dataset.index = i;
+    handle.style.left = '50%';
+    handle.style.top = `${y}px`;
+    container.appendChild(handle);
+  }
+  
+  // Add event listeners for dragging
+  const handles = document.querySelectorAll('.line-handle');
+  handles.forEach(handle => {
+    handle.addEventListener('mousedown', startDrag);
+  });
+}
+
+function startDrag(e) {
+  e.preventDefault();
+  activeHandle = e.target;
+  const rect = activeHandle.getBoundingClientRect();
+  handleOffsetX = e.clientX - rect.left;
+  handleOffsetY = e.clientY - rect.top;
+  
+  document.addEventListener('mousemove', dragHandle);
+  document.addEventListener('mouseup', stopDrag);
+}
+
+function dragHandle(e) {
+  if (!activeHandle) return;
+  
+  const container = $('preview');
+  const rect = container.getBoundingClientRect();
+  const type = activeHandle.dataset.type;
+  const index = parseInt(activeHandle.dataset.index);
+  
+  let x = e.clientX - rect.left - handleOffsetX;
+  let y = e.clientY - rect.top - handleOffsetY;
+  
+  // Constrain to canvas bounds
+  x = Math.max(0, Math.min(container.width, x));
+  y = Math.max(0, Math.min(container.height, y));
+  
+  if (type === 'vertical') {
+    activeHandle.style.left = `${x}px`;
+    columnXs[index] = Math.round(x / scale);
+  } else {
+    activeHandle.style.top = `${y}px`;
+    rowYs[index] = Math.round(y / scale);
+  }
+  
+  drawOverlayRects();
+}
+
+function stopDrag() {
+  document.removeEventListener('mousemove', dragHandle);
+  document.removeEventListener('mouseup', stopDrag);
+  activeHandle = null;
+  
+  // After adjusting lines, we can re-run OCR on the adjusted cells
+  // or just update the display (depending on your needs)
+  log('Grid lines adjusted manually');
+}
 
 function drawOverlayRects(){
   const o = $('overlay'), ctx = o.getContext('2d');
@@ -288,6 +397,7 @@ function detectGridAndCells() {
   columnXs.push(c.width);
 
   drawOverlayRects();
+  createLineHandles();
 
   bin.delete(); mat.delete(); matRGBA.delete();
   horizontalStructure.delete(); verticalStructure.delete();
