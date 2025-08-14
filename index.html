@@ -1,12 +1,12 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>OCR Table → Google Sheets</title>
+  <title>Table OCR to Google Sheets</title>
   <meta charset="UTF-8">
   <style>
     body { font-family: Arial, sans-serif; padding: 10px; }
     canvas { border: 1px solid #ccc; cursor: crosshair; }
-    #log { height: 150px; overflow-y: auto; background: #f4f4f4; padding: 5px; border: 1px solid #ddd; margin-top: 10px; font-size: 12px; }
+    #log { height: 150px; overflow-y: auto; background: #f4f4f4; padding: 5px; border: 1px solid #ddd; margin-top: 10px; }
     button { margin: 5px 0; }
   </style>
 </head>
@@ -27,10 +27,8 @@
     const logBox = document.getElementById('log');
 
     let img = new Image();
-    let colLines = []; // vertical boundaries
-    let rowLines = []; // horizontal boundaries
+    let colLines = []; // x positions of column lines
     let draggingLine = null;
-    let draggingType = null; // "col" or "row"
     let ocrResults = [];
 
     function log(msg) {
@@ -48,52 +46,42 @@
           canvas.width = img.width;
           canvas.height = img.height;
           ctx.drawImage(img, 0, 0);
-          detectGrid();
+          detectColumns();
         };
         img.src = ev.target.result;
       };
       reader.readAsDataURL(file);
     });
 
-    // Detect rows & columns using OpenCV
-    function detectGrid() {
+    // Basic column detection using OpenCV
+    function detectColumns() {
       let src = cv.imread(img);
       let gray = new cv.Mat();
       cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
       cv.threshold(gray, gray, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
 
-      // Detect vertical lines
-      let verticalKernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(1, 50));
-      let temp1 = new cv.Mat();
-      cv.erode(gray, temp1, verticalKernel);
-      cv.dilate(temp1, temp1, verticalKernel);
-      colLines = getLinePositions(temp1, "vertical");
+      let verticalKernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(1, 75));
+      let temp = new cv.Mat();
+      cv.erode(gray, temp, verticalKernel);
+      cv.dilate(temp, temp, verticalKernel);
 
-      // Detect horizontal lines
-      let horizontalKernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(50, 1));
-      let temp2 = new cv.Mat();
-      cv.erode(gray, temp2, horizontalKernel);
-      cv.dilate(temp2, temp2, horizontalKernel);
-      rowLines = getLinePositions(temp2, "horizontal");
-
-      src.delete(); gray.delete(); temp1.delete(); temp2.delete();
-      drawCanvas();
-      log(`Detected ${colLines.length} vertical lines & ${rowLines.length} horizontal lines.`);
-    }
-
-    function getLinePositions(mat, type) {
+      // Find contours (vertical lines)
       let contours = new cv.MatVector();
       let hierarchy = new cv.Mat();
-      cv.findContours(mat, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-      let positions = [];
+      cv.findContours(temp, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+      colLines = [];
       for (let i = 0; i < contours.size(); i++) {
         let rect = cv.boundingRect(contours.get(i));
-        positions.push(type === "vertical" ? rect.x : rect.y);
+        colLines.push(rect.x);
       }
-      contours.delete(); hierarchy.delete();
-      return positions.sort((a, b) => a - b);
+      colLines.sort((a, b) => a - b);
+
+      src.delete(); gray.delete(); temp.delete(); contours.delete(); hierarchy.delete();
+      drawCanvas();
+      log("Detected " + colLines.length + " column lines. Drag to adjust.");
     }
 
+    // Draw image + vertical lines
     function drawCanvas() {
       ctx.drawImage(img, 0, 0);
       ctx.strokeStyle = "red";
@@ -104,70 +92,35 @@
         ctx.lineTo(x, canvas.height);
         ctx.stroke();
       });
-      ctx.strokeStyle = "blue";
-      rowLines.forEach(y => {
-        ctx.beginPath();
-        ctx.moveTo(0, y);
-        ctx.lineTo(canvas.width, y);
-        ctx.stroke();
-      });
     }
 
-    // Drag lines
+    // Drag-to-adjust
     canvas.addEventListener('mousedown', e => {
-      const mx = e.offsetX, my = e.offsetY;
+      const mx = e.offsetX;
       for (let i = 0; i < colLines.length; i++) {
         if (Math.abs(mx - colLines[i]) < 5) {
-          draggingLine = i; draggingType = "col"; return;
-        }
-      }
-      for (let i = 0; i < rowLines.length; i++) {
-        if (Math.abs(my - rowLines[i]) < 5) {
-          draggingLine = i; draggingType = "row"; return;
+          draggingLine = i;
+          break;
         }
       }
     });
     canvas.addEventListener('mousemove', e => {
       if (draggingLine !== null) {
-        if (draggingType === "col") colLines[draggingLine] = e.offsetX;
-        else rowLines[draggingLine] = e.offsetY;
+        colLines[draggingLine] = e.offsetX;
         drawCanvas();
       }
     });
-    canvas.addEventListener('mouseup', () => { draggingLine = null; draggingType = null; });
+    canvas.addEventListener('mouseup', () => draggingLine = null);
 
-    // OCR
+    // Run OCR per column & row
     document.getElementById('runOCR').addEventListener('click', async () => {
-      if (colLines.length < 2 || rowLines.length < 2) {
-        log("Need at least 2 lines in each direction.");
-        return;
-      }
+      log("Running OCR...");
       ocrResults = [];
-      log("Running OCR cell-by-cell...");
-      for (let r = 0; r < rowLines.length - 1; r++) {
-        let rowData = [];
-        for (let c = 0; c < colLines.length - 1; c++) {
-          let x = colLines[c], y = rowLines[r];
-          let w = colLines[c+1] - x, h = rowLines[r+1] - y;
-          let cellCanvas = document.createElement('canvas');
-          cellCanvas.width = w; cellCanvas.height = h;
-          cellCanvas.getContext('2d').drawImage(canvas, x, y, w, h, 0, 0, w, h);
-          let dataUrl = cellCanvas.toDataURL();
-          let result = await Tesseract.recognize(dataUrl, 'eng');
-          rowData.push(result.data.text.trim());
-        }
-        // Map into fixed order
-        let mapped = [
-          rowData[0] || "", // Company Name
-          rowData[1] || "", // Person in Charge
-          rowData[2] || "", // Tel/Fax
-          rowData[3] || "", // Company Address
-          rowData[4] || ""  // Project
-        ];
-        ocrResults.push(mapped);
-        log("Row " + (r+1) + ": " + JSON.stringify(mapped));
-      }
-      log("OCR complete.");
+      // For now, we just run OCR on the full image, then you can split per row/col if needed
+      let result = await Tesseract.recognize(img.src, 'eng', { logger: m => {} });
+      log("OCR done.");
+      log(result.data.text);
+      ocrResults.push(result.data.text);
     });
 
     // Send to Google Sheets
@@ -176,13 +129,15 @@
         log("No OCR data to send!");
         return;
       }
-      const url = "YOUR_GOOGLE_APPS_SCRIPT_WEB_APP_URL"; // Replace
+      const url = "YOUR_GOOGLE_APPS_SCRIPT_WEB_APP_URL"; // Replace with your script URL
+      let data = { rows: ocrResults }; 
       let res = await fetch(url, {
         method: "POST",
-        body: JSON.stringify({ rows: ocrResults }),
+        body: JSON.stringify(data),
         headers: { "Content-Type": "application/json" }
       });
-      log("Sent to Sheets: " + await res.text());
+      let text = await res.text();
+      log("Sent to Sheets: " + text);
     });
   </script>
 </body>
