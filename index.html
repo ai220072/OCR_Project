@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Table OCR → Google Sheets ver2</title>
+<title>1Table OCR → Google Sheets</title>
 <!-- Tesseract.js (OCR) -->
 <script src="https://unpkg.com/tesseract.js@v5.1.1/dist/tesseract.min.js"></script>
 <!-- OpenCV.js (table/line detection) -->
@@ -28,22 +28,25 @@
   th, td { text-align:left; border-bottom:1px solid #eee; padding:8px; vertical-align: top; }
   .muted { color:#666; font-size:12px; }
   .small { font-size: 12px; }
-  .line-handle {
-    position: absolute;
-    width: 12px;
-    height: 12px;
-    background: #f00;
-    border-radius: 50%;
-    cursor: move;
-    pointer-events: all;
-    transform: translate(-6px, -6px);
-    z-index: 10;
-  }
-  .line-handle.horizontal { background: #00f; }
-  .line-handle.vertical { background: #0a0; }
   .canvas-container {
     position: relative;
     margin-top: 12px;
+  }
+  .line {
+    position: absolute;
+    pointer-events: all;
+    cursor: move;
+    z-index: 10;
+  }
+  .vertical-line {
+    width: 2px;
+    height: 100%;
+    background: rgba(0, 0, 255, 0.7);
+  }
+  .horizontal-line {
+    height: 2px;
+    width: 100%;
+    background: rgba(0, 150, 0, 0.7);
   }
 </style>
 </head>
@@ -67,7 +70,7 @@
       <div class="canvas-container">
         <canvas id="preview"></canvas>
         <canvas id="overlay"></canvas>
-        <div id="line-handles"></div>
+        <div id="lines-container"></div>
       </div>
 
       <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:var(--gap);margin-top:12px;">
@@ -160,9 +163,10 @@ let cvReady = false, srcImg=null, srcMat=null, scale=1;
 let columnXs = [];   // x boundaries for columns
 let rowYs = [];      // y boundaries for rows
 let rowsOut = [];    // rows mapped to desired order
-let activeHandle = null;
-let handleOffsetX = 0;
-let handleOffsetY = 0;
+let isDragging = false;
+let currentLine = null;
+let initialX = 0;
+let initialY = 0;
 
 function onOpenCvReady(){ cvReady = true; log('OpenCV.js loaded'); maybeEnableScan(); }
 function maybeEnableScan(){ if (cvReady && srcImg) $('scan').disabled = false; }
@@ -226,94 +230,87 @@ $('reset').addEventListener('click', ()=>{
   $('scan').disabled = !srcImg || !cvReady;
   $('send').disabled = true;
   setProgress(0);
-  clearLineHandles();
+  clearLines();
   log('Reset.');
 });
 
-function clearLineHandles() {
-  $('line-handles').innerHTML = '';
+function clearLines() {
+  $('lines-container').innerHTML = '';
 }
 
-function createLineHandles() {
-  clearLineHandles();
-  
-  const container = $('line-handles');
-  
+function createDraggableLines() {
+  clearLines();
+  const container = $('lines-container');
+  const preview = $('preview');
+
   // Vertical lines (columns)
   for (let i = 0; i < columnXs.length; i++) {
-    const x = columnXs[i] * scale;
-    const handle = document.createElement('div');
-    handle.className = 'line-handle vertical';
-    handle.dataset.type = 'vertical';
-    handle.dataset.index = i;
-    handle.style.left = `${x}px`;
-    handle.style.top = '50%';
-    container.appendChild(handle);
+    const line = document.createElement('div');
+    line.className = 'line vertical-line';
+    line.dataset.type = 'vertical';
+    line.dataset.index = i;
+    line.style.left = `${columnXs[i] * scale}px`;
+    container.appendChild(line);
+
+    line.addEventListener('mousedown', startLineDrag);
   }
-  
+
   // Horizontal lines (rows)
   for (let i = 0; i < rowYs.length; i++) {
-    const y = rowYs[i] * scale;
-    const handle = document.createElement('div');
-    handle.className = 'line-handle horizontal';
-    handle.dataset.type = 'horizontal';
-    handle.dataset.index = i;
-    handle.style.left = '50%';
-    handle.style.top = `${y}px`;
-    container.appendChild(handle);
+    const line = document.createElement('div');
+    line.className = 'line horizontal-line';
+    line.dataset.type = 'horizontal';
+    line.dataset.index = i;
+    line.style.top = `${rowYs[i] * scale}px`;
+    container.appendChild(line);
+
+    line.addEventListener('mousedown', startLineDrag);
   }
-  
-  // Add event listeners for dragging
-  const handles = document.querySelectorAll('.line-handle');
-  handles.forEach(handle => {
-    handle.addEventListener('mousedown', startDrag);
-  });
+
+  document.addEventListener('mousemove', dragLine);
+  document.addEventListener('mouseup', stopLineDrag);
 }
 
-function startDrag(e) {
+function startLineDrag(e) {
   e.preventDefault();
-  activeHandle = e.target;
-  const rect = activeHandle.getBoundingClientRect();
-  handleOffsetX = e.clientX - rect.left;
-  handleOffsetY = e.clientY - rect.top;
+  isDragging = true;
+  currentLine = e.target;
+  initialX = e.clientX;
+  initialY = e.clientY;
   
-  document.addEventListener('mousemove', dragHandle);
-  document.addEventListener('mouseup', stopDrag);
+  // Bring the line to front while dragging
+  currentLine.style.zIndex = '20';
 }
 
-function dragHandle(e) {
-  if (!activeHandle) return;
+function dragLine(e) {
+  if (!isDragging || !currentLine) return;
   
-  const container = $('preview');
-  const rect = container.getBoundingClientRect();
-  const type = activeHandle.dataset.type;
-  const index = parseInt(activeHandle.dataset.index);
-  
-  let x = e.clientX - rect.left - handleOffsetX;
-  let y = e.clientY - rect.top - handleOffsetY;
-  
-  // Constrain to canvas bounds
-  x = Math.max(0, Math.min(container.width, x));
-  y = Math.max(0, Math.min(container.height, y));
+  const type = currentLine.dataset.type;
+  const index = parseInt(currentLine.dataset.index);
+  const preview = $('preview');
+  const rect = preview.getBoundingClientRect();
   
   if (type === 'vertical') {
-    activeHandle.style.left = `${x}px`;
-    columnXs[index] = Math.round(x / scale);
+    const newX = Math.max(0, Math.min(preview.width, currentLine.offsetLeft + (e.clientX - initialX)));
+    currentLine.style.left = `${newX}px`;
+    columnXs[index] = Math.round(newX / scale);
+    initialX = e.clientX;
   } else {
-    activeHandle.style.top = `${y}px`;
-    rowYs[index] = Math.round(y / scale);
+    const newY = Math.max(0, Math.min(preview.height, currentLine.offsetTop + (e.clientY - initialY)));
+    currentLine.style.top = `${newY}px`;
+    rowYs[index] = Math.round(newY / scale);
+    initialY = e.clientY;
   }
   
   drawOverlayRects();
 }
 
-function stopDrag() {
-  document.removeEventListener('mousemove', dragHandle);
-  document.removeEventListener('mouseup', stopDrag);
-  activeHandle = null;
-  
-  // After adjusting lines, we can re-run OCR on the adjusted cells
-  // or just update the display (depending on your needs)
+function stopLineDrag() {
+  if (currentLine) {
+    currentLine.style.zIndex = '10';
+  }
+  isDragging = false;
+  currentLine = null;
   log('Grid lines adjusted manually');
 }
 
@@ -332,85 +329,92 @@ function drawOverlayRects(){
 
 /* ---------- Table detection with OpenCV ---------- */
 function detectGridAndCells() {
-  const blk = Math.max(3, parseInt($('blk').value)|0) | 1; // odd
-  const Cval = parseInt($('Cval').value)|0;
-  const hks = Math.max(5, parseInt($('hks').value)|0);
-  const vks = Math.max(5, parseInt($('vks').value)|0);
-  const minh = Math.max(10, parseInt($('minh').value)|0);
+  // Only run detection if we haven't manually adjusted lines yet
+  if (columnXs.length === 0 || rowYs.length === 0) {
+    const blk = Math.max(3, parseInt($('blk').value)|0) | 1; // odd
+    const Cval = parseInt($('Cval').value)|0;
+    const hks = Math.max(5, parseInt($('hks').value)|0);
+    const vks = Math.max(5, parseInt($('vks').value)|0);
+    const minh = Math.max(10, parseInt($('minh').value)|0);
 
-  // Build cv.Mat from canvas
-  const c = $('preview');
-  const matRGBA = cv.imread(c);
-  const mat = new cv.Mat();
-  cv.cvtColor(matRGBA, mat, cv.COLOR_RGBA2GRAY);
+    // Build cv.Mat from canvas
+    const c = $('preview');
+    const matRGBA = cv.imread(c);
+    const mat = new cv.Mat();
+    cv.cvtColor(matRGBA, mat, cv.COLOR_RGBA2GRAY);
 
-  // Adaptive threshold to get binary
-  const bin = new cv.Mat();
-  cv.adaptiveThreshold(mat, bin, 255, cv.ADAPTIVE_THRESH_MEAN_C, cv.THRESH_BINARY_INV, blk, Cval);
+    // Adaptive threshold to get binary
+    const bin = new cv.Mat();
+    cv.adaptiveThreshold(mat, bin, 255, cv.ADAPTIVE_THRESH_MEAN_C, cv.THRESH_BINARY_INV, blk, Cval);
 
-  // Horizontal lines
-  const horizontalsize = hks;
-  const horizontalStructure = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(horizontalsize, 1));
-  const horizontal = new cv.Mat();
-  cv.erode(bin, horizontal, horizontalStructure);
-  cv.dilate(horizontal, horizontal, horizontalStructure);
+    // Horizontal lines
+    const horizontalsize = hks;
+    const horizontalStructure = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(horizontalsize, 1));
+    const horizontal = new cv.Mat();
+    cv.erode(bin, horizontal, horizontalStructure);
+    cv.dilate(horizontal, horizontal, horizontalStructure);
 
-  // Vertical lines
-  const verticalsize = vks;
-  const verticalStructure = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(1, verticalsize));
-  const vertical = new cv.Mat();
-  cv.erode(bin, vertical, verticalStructure);
-  cv.dilate(vertical, vertical, verticalStructure);
+    // Vertical lines
+    const verticalsize = vks;
+    const verticalStructure = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(1, verticalsize));
+    const vertical = new cv.Mat();
+    cv.erode(bin, vertical, verticalStructure);
+    cv.dilate(vertical, vertical, verticalStructure);
 
-  // Get contours of horizontal lines -> y positions
-  let contours = new cv.MatVector(), hierarchy = new cv.Mat();
-  cv.findContours(horizontal, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-  const yCandidates = [];
-  for (let i=0;i<contours.size();i++){
-    const r = cv.boundingRect(contours.get(i));
-    if (r.width > c.width*0.4) yCandidates.push(r.y);
+    // Get contours of horizontal lines -> y positions
+    let contours = new cv.MatVector(), hierarchy = new cv.Mat();
+    cv.findContours(horizontal, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    const yCandidates = [];
+    for (let i=0;i<contours.size();i++){
+      const r = cv.boundingRect(contours.get(i));
+      if (r.width > c.width*0.4) yCandidates.push(r.y);
+    }
+    yCandidates.sort((a,b)=>a-b);
+
+    // dedupe y's (merge near)
+    rowYs = [];
+    for (const y of yCandidates) {
+      if (!rowYs.length || Math.abs(y - rowYs[rowYs.length-1]) > minh) rowYs.push(y);
+    }
+    // add bottom edge
+    rowYs.push(c.height);
+
+    // Vertical lines -> x positions
+    contours.delete(); hierarchy.delete();
+    contours = new cv.MatVector(); hierarchy = new cv.Mat();
+    cv.findContours(vertical, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+    const xCandidates = [];
+    for (let i=0;i<contours.size();i++){
+      const r = cv.boundingRect(contours.get(i));
+      if (r.height > c.height*0.4) xCandidates.push(r.x);
+    }
+    xCandidates.sort((a,b)=>a-b);
+    columnXs = [0];
+    for (const x of xCandidates) {
+      if (Math.abs(x - columnXs[columnXs.length-1]) > 15) columnXs.push(x);
+    }
+    columnXs.push(c.width);
+
+    bin.delete(); mat.delete(); matRGBA.delete();
+    horizontalStructure.delete(); verticalStructure.delete();
+    horizontal.delete(); vertical.delete();
+    contours.delete(); hierarchy.delete();
+
+    log(`Detected ~${rowYs.length-1} row bands and ${columnXs.length-1} columns.`);
   }
-  yCandidates.sort((a,b)=>a-b);
-
-  // dedupe y's (merge near)
-  rowYs = [];
-  for (const y of yCandidates) {
-    if (!rowYs.length || Math.abs(y - rowYs[rowYs.length-1]) > minh) rowYs.push(y);
-  }
-  // add bottom edge
-  rowYs.push(c.height);
-
-  // Vertical lines -> x positions
-  contours.delete(); hierarchy.delete();
-  contours = new cv.MatVector(); hierarchy = new cv.Mat();
-  cv.findContours(vertical, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-  const xCandidates = [];
-  for (let i=0;i<contours.size();i++){
-    const r = cv.boundingRect(contours.get(i));
-    if (r.height > c.height*0.4) xCandidates.push(r.x);
-  }
-  xCandidates.sort((a,b)=>a-b);
-  columnXs = [0];
-  for (const x of xCandidates) {
-    if (Math.abs(x - columnXs[columnXs.length-1]) > 15) columnXs.push(x);
-  }
-  columnXs.push(c.width);
 
   drawOverlayRects();
-  createLineHandles();
-
-  bin.delete(); mat.delete(); matRGBA.delete();
-  horizontalStructure.delete(); verticalStructure.delete();
-  horizontal.delete(); vertical.delete();
-  contours.delete(); hierarchy.delete();
-
-  log(`Detected ~${rowYs.length-1} row bands and ${columnXs.length-1} columns.`);
+  createDraggableLines();
 }
 
 /* ---------- OCR with Tesseract ---------- */
 async function runOCRAndAssemble() {
   setProgress(2);
-  detectGridAndCells();
+  
+  // Only detect grid if we haven't manually adjusted lines yet
+  if (columnXs.length === 0 || rowYs.length === 0) {
+    detectGridAndCells();
+  }
 
   const worker = await Tesseract.createWorker('eng', 1, {
     logger: m => {
@@ -442,7 +446,7 @@ async function runOCRAndAssemble() {
   // Map each token to a cell by [row band, column band]
   function findBand(val, bounds){
     for (let i=0;i<bounds.length-1;i++){
-      if (val*scale >= bounds[i]*scale && val*scale < bounds[i+1]*scale) return i;
+      if (val >= bounds[i] && val < bounds[i+1]) return i;
     }
     return bounds.length-2;
   }
@@ -450,7 +454,9 @@ async function runOCRAndAssemble() {
   for (const t of toks) {
     const r = findBand(t.y, rowYs);
     const c = findBand(t.x, columnXs);
-    grid[r][c] = (grid[r][c] ? grid[r][c]+' ' : '') + t.text;
+    if (r >= 0 && c >= 0 && r < grid.length && c < grid[r].length) {
+      grid[r][c] = (grid[r][c] ? grid[r][c]+' ' : '') + t.text;
+    }
   }
 
   // Your original table columns:
